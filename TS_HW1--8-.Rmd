@@ -1,0 +1,840 @@
+---
+title: "Time Series Homework 1"
+author: "Ekaterina Petrova, Anna Zhurba, Arsenii Lishnevsky"
+date: "21 02 2024"
+output:
+  html_document: default
+  pdf_document: 
+    toc: true
+---
+```{r eval=FALSE, include=FALSE}
+packs=c("urca",
+"seasonal",
+"tseries",
+"forecast",
+"ggplot2",
+#"readxl",
+"openxlsx",
+"imputeTS",
+"meboot",
+"tvReg",
+
+"data.table",
+"strucchange",
+"dtwclust",
+"tsfeatures",
+"padr",
+"tidyr",
+"dplyr",
+
+"randomForest",
+"datasets",
+"caret",
+
+"MSwM")
+
+install.packages(packs)
+
+
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(urca)
+library(seasonal)
+library(tseries)
+library(forecast)
+library(ggplot2)
+#library(readxl)
+library("openxlsx")
+library(imputeTS)
+library(meboot)
+library(tvReg)
+
+library(data.table)
+library(strucchange)
+library(dtwclust)
+library(tsfeatures)
+library(padr)
+library(tidyr)
+library(dplyr)
+
+library(randomForest)
+library(datasets)
+library(caret)
+
+library(MSwM)
+
+```
+
+Мы выбрали для анализа и предсказаний времененные ряды средневзвешенного ETC купли-продажи денежных средств в долларах США в лотах за российские рубли. Сайт источника: https://www.moex.com/a1494
+
+## Очитска и структуризация данных
+
+Первоначальные данные будних дней с 15.04.2003 по 05.03.2024. Первым шагом добавляем все дни в году, включающие праздничные и выходные, когда торги на бирже не велись. Дальше, удаляем все значения за 29 февраля. Следующим шагом мы предполагаем, что в дни, где предшедствующие дни пустые, участники ориентировались на предыдущие значения ставок. Поэтому заменяем пустые значения на последние известные значения дней, когда торги велись. В итоге, мы получаем временной ряд в 7625 наблюдений. Ниже можем наблюдать как распределена по времени ставка:
+
+
+```{r}
+
+dd <- read.xlsx("C:/Users/user/Documents/time_series/ts_hw/USDRUB_TOM.xlsx", 
+                sheet = "Sheet1")
+dd$Дата.торгов=as.Date(dd$Дата.торгов,origin = "1899-12-30")
+dd=pad(dd)
+dd$day_month = format(dd$Дата.торгов,"%m %d")
+dd = dd[dd$day_month != "02 29",] # исключаем 29 февраля
+dd$moex_works= ifelse(is.na(dd$Кратк..наим.), 0, 1) # даты по которым изначально не было данных (NA) - предполагаем, что биржа не работала в эти дни
+dd=fill(dd,Ср.взв..ЕТС)
+dd=fill(dd,Закр.)
+dd=replace_na(dd,list('Объем.сделок.-.руб.'=0,'Сделок'=0))
+dd=mutate(dd,Закр. = as.numeric(na_if(Закр., 0))) %>%  fill(Закр., .direction = 'up') # заменяем 0 на предыдущие значения
+dd$regulations=ifelse(dd$Дата.торгов<as.Date('2014-11-10',origin = "1899-12-30"), 1, 0) # отказ от управляемого курса
+
+oil <- read.xlsx("C:/Users/user/Documents/time_series/ts_hw/RBRTEd.xlsx", 
+                sheet = "Data 1")
+oil$Sourcekey=as.Date(oil$Sourcekey,origin = "1899-12-30")
+
+ir <- read.xlsx("C:/Users/user/Documents/time_series/ts_hw/ставка_цб.xlsx", 
+                sheet = "Sheet2")
+ir$date=as.Date(ir$date,origin = "1899-12-30")
+
+dd=merge(x = dd, y = oil, by.x = "Дата.торгов", by.y = 'Sourcekey', all.x = TRUE)
+dd=merge(x = dd, y = ir, by.x = "Дата.торгов", by.y = 'date', all.x = TRUE)
+
+dd=fill(dd,RBRTE)
+dd=fill(dd,int_rate)
+
+dd$int_rate=ifelse(is.na(dd$int_rate),18, dd$int_rate)
+
+
+
+usd=ts(dd$Закр., 
+       start = c(2003,105), 
+       frequency = 365)
+
+autoplot(usd)
+```
+
+На графике временного ряда USDRUB_TOM видно, что это нестационарный процесс с возрастающим трендом и большими выбросами в конце ряда.
+
+
+
+## Проверка на стационарность
+
+```{r warning=FALSE}
+adf.test(usd) 
+pp.test(usd) 
+kpss.test(usd) 
+```
+
+Стационарность на 5% уровне не подтвердилась в двух из трех тестов. Зато подтвердилась во всех на 10% уровне значимости.
+
+```{r warning=FALSE}
+adf.test(diff(usd)) #p-value = 0.01 - stationary
+pp.test(diff(usd)) #p-value = 0.01 - stationary
+kpss.test(diff(usd)) #p-value = 0.0904 - stationary on 5% significance
+```
+
+А в случае разницы значений, наоборот, подтвердилась в двух из трех тестов на 5% уровне и во всех на 10% уровне.
+
+## ACF PACF
+
+
+```{r warning=FALSE}
+acf(usd)
+pacf(usd)
+```
+По графику ACF видно, что ряд нестационарен, т.к.автокорреляция с лагами везде превышает пороговое значение.
+
+Чтобы преобразовать наш ряд в стационарный, возьмем первые разницы:
+```{r warning=FALSE}
+plot(diff(usd, 1))
+
+acf(diff(usd))
+pacf(diff(usd))
+
+
+d_usd = diff(usd)
+
+```
+
+
+Мы использовали в работе  
+
+# Модели
+1. auto-ARIMA
+2. другие аримы
+3. ARIMAX
+4. SARIMA
+5. ETS
+6. Исследовать на структурные сдвиги
+
+В основе формирования моделей лежат следующие принципы:
+  Мы решили кросс-валидировать ряд с шагом = 100.
+  Обучить модель на тренировочной выборке данных (trainUSD для моделей, не требующих стационарности и d_trainUSD, требующих стационарности).
+  Сформировать прогноз с шагом 1 на будущие 100 значений.
+  Сравнить полученные результаты с тестовой выборкой (testUSD для моделей, не требующих стационарности и d_testUSD, требующих стационарности).
+  Рассчитать основные показатели на основе ошибки прогноза: MSE, RMSE, MAE, MAPE, MASE.
+
+
+
+# Тип тестироавния
+cross validation (fixed window) 7524/100 
+
+
+
+# Метод тестирования
+1. MASE
+2. MSE
+3. RMSE
+4. MAE
+5. MAPE
+6. тест диболда-мариано
+
+
+## Выборки
+
+Разделим ряд usd на тренировочную и тестовую выборку. К тестовой части будет относиться последние 100 значений ряда.
+```{r warning=FALSE}
+#nToPred = 0.1*(length(d_usd))
+nToPred = 100
+testUSD = ts(usd[(length(d_usd) - nToPred):length(usd)],
+       end = c(2024,64), #end = c(2024,3, 5), start = c(2023,11,25), 
+       frequency = 365)# from 7524 to 7624
+
+trainUSD = ts(usd[1:(length(usd) - nToPred - 1)],
+       start = c(2003,104), #end = c(2023,11,25),
+       frequency = 365) # from 1 to 7523
+
+# Сформируем для обеих частей (тренировочной и тестовой) первые разности, чтобы далее исследовать более стационарный ряд
+
+d_testUSD = diff(testUSD)
+d_trainUSD = diff(trainUSD)
+
+plot(trainUSD)
+lines(testUSD, col = "red")
+
+plot(d_trainUSD)
+lines(d_testUSD, col = "red")
+```
+
+## Наивная модель
+
+
+```{r warning=FALSE}
+#Naive-forecasting for I=0
+err_Naive = c()
+
+NaiveForecast = trainUSD[1:length(testUSD)]
+err_Naive = testUSD - NaiveForecast
+
+mean(err_Naive^2) ##MSE
+sqrt(mean(err_Naive)) ##RMSE
+mean(abs(err_Naive)) ##MAE
+mean(abs(err_Naive/testUSD)*100) ##MAPE
+mean(abs(err_Naive))/mean(abs(err_Naive)) ##MASE
+
+autoplot(ts(err_Naive)) + xlab("Day") + ylab("") +
+  ggtitle("Residuals from Naive-forecasing")
+gghistogram(err_Naive) + ggtitle("Histogram of residuals of Naive-forecasing")
+```
+
+
+```{r warning=FALSE}
+#Naive-forecasting for I=1 (diff(usd))
+err_Naive1 = c()
+
+NaiveForecast = d_trainUSD[1:length(d_testUSD)]
+err_Naive1 = d_testUSD - NaiveForecast
+
+mean(err_Naive^2) ##MSE
+sqrt(mean(err_Naive1)) ##RMSE
+mean(abs(err_Naive1)) ##MAE
+mean(abs(err_Naive1/testUSD)*100) ##MAPE
+mean(abs(err_Naive1))/mean(abs(err_Naive1)) ##MASE
+
+autoplot(ts(err_Naive1)) + xlab("Day") + ylab("") +
+  ggtitle("Residuals from Naive-forecasing for first difference")
+gghistogram(err_Naive1) + ggtitle("Histogram of residuals of Naive-forecasing for first difference")
+
+```
+
+
+## Auto.ARIMA
+Построим авто.ариму. За основу взят ряд с первыми разностями d_usd, поэтому в результате мы получили модель ARIMA(0,0,1) или модель скользящего среднего с одним лагом
+
+```{r warning=FALSE, include=FALSE,cache = TRUE}
+nCV = 100
+
+err_AUTO.ARIMA = c()
+
+for (i in 1:nCV){
+  tmpUSD = trainUSD[(1+i-1):(length(trainUSD)-nCV+i)]  # fixed window
+  tmp = ts(tmpUSD, 
+           start = c(2003,104), 
+           frequency = 365)
+  
+  mAUTO.ARIMA <- auto.arima(tmp)
+  err_AUTO.ARIMA[i] = forecast::forecast(mAUTO.ARIMA)$mean[1] - trainUSD[1:(length(trainUSD)-1+i)]
+  
+}
+```
+```{r warning=FALSE}
+err_AUTO.ARIMA
+
+summary(mAUTO.ARIMA)
+autoplot(ts(err_AUTO.ARIMA)) + xlab("Day") + ylab("") +
+  ggtitle("Residuals from AUTO.ARIMA(0,0,1)")
+gghistogram(err_AUTO.ARIMA) + ggtitle("Histogram of residuals AUTO.ARIMA(0,0,1)")
+checkresiduals(mAUTO.ARIMA) 
+```
+
+
+Также нами было принято решение построить ARIMA(1,0,2), опираясь на графики ACF и PACF на основе ряда d_usd (с первыми разностями)
+MASE = 0.6239841
+
+```{r warning=FALSE,cache = TRUE}
+err_ARIMA1 = c()
+for (i in 1:nCV){
+  tmpUSD = d_trainUSD[(1+i-1):(length(d_trainUSD)-nCV+i)]  # fixed window
+  tmp = ts(tmpUSD, 
+           start = c(2003,104), 
+           frequency = 365)
+  
+  mARIMA1 = Arima(tmp, order = c(1,0,2))
+  err_ARIMA1[i] = forecast::forecast(mARIMA1)$mean[1] - d_trainUSD[1:(length(d_trainUSD)-i+1)] 
+  
+}
+summary(mARIMA1)
+plot(d_usd)
+lines((d_usd - mARIMA1$residuals), col='dark blue')
+plot(mARIMA1$residuals)
+gghistogram(err_ARIMA1) + ggtitle("Histogram of residuals ARIMA(1,0,2)")
+autoplot(ts(err_ARIMA1))+ xlab("Day") + ggtitle("Residuals from ARIMA(1,0,2)")
+checkresiduals(mARIMA1) 
+
+```
+
+
+Вдобавок, нами было принято решение построить ARIMA(1,1,1), опираясь на графики ACF и PACF.В основе модели ряд d_usd (с первыми разностями), применяя модель ARIMA(1,1,1), мы хотели таким образом протестировать вторые разности.
+
+```{r warning=FALSE,cache = TRUE}
+err_ARIMA2 = c()
+for (i in 1:nCV){
+  tmpUSD = d_trainUSD[(1+i-1):(length(d_trainUSD)-nCV+i)]  # fixed window
+  tmp = ts(tmpUSD, 
+           start = c(2003,104), 
+           frequency = 365)
+  
+  mARIMA2 = Arima(tmp, order = c(1,1,1))
+  err_ARIMA2[i] = forecast::forecast(mARIMA2)$mean[1] - d_trainUSD[1:(length(d_trainUSD)-i+1)] 
+  
+}
+
+summary(mARIMA2)
+plot(d_usd)
+lines((d_usd - mARIMA2$residuals), col='dark blue')
+plot(mARIMA2$residuals)
+gghistogram(err_ARIMA2) + ggtitle("Histogram of residuals ARIMA(1,1,1)")
+autoplot(ts(err_ARIMA2))+ xlab("Day") + ggtitle("Residuals from ARIMA(1,1,1)")
+checkresiduals(mARIMA2) 
+```
+
+
+Результаты MASE:
+
+ARIMA1(1,0,2)
+MASE = 0.6239841 (summary)
+
+
+ARIMA2(1,1,1)
+MASE = 0.620264  (summary)
+
+## ARIMAX
+
+```{r ARIMAX, include=FALSE,cache = TRUE}
+library(forecast)
+library(Metrics)
+library(foreach)
+library(doParallel)
+library(doFuture)
+
+# https://www.eia.gov/dnav/pet/hist/LeafHandler.ashx?n=PET&s=RBRTE&f=M
+
+
+X=select(dd, moex_works,regulations,RBRTE,int_rate,`Объем.сделок.-.руб.`)
+
+testX = X[(nrow(X) - nToPred):nrow(X)-1,]  # from 7524 to 7624
+trainX = X[1:(nrow(X) - nToPred - 1-1),] # from 1 to 7523
+
+ps <- c(0,1,3,7)
+ds = 2
+qs <- c(0,1,3,7)
+Hs = c(20,100)
+future::plan(multisession, workers = 4)
+# all_res = foreach(p = 1:length(ps),.combine =rbind,.options.future = list(packages=c('forecast','Metrics','foreach','doFuture')), .inorder=FALSE,.verbose=TRUE) %:%
+#   foreach(d = 0:ds,.combine =rbind,.options.future = list(packages=c('forecast','Metrics','foreach','doFuture')), .inorder=FALSE,.verbose=TRUE)  %:%
+#     foreach(q = 1:length(qs),.combine =rbind,.options.future = list(packages=c('forecast','Metrics','foreach','doFuture')), .inorder=FALSE,.verbose=TRUE) %:%
+#       foreach(h = 1:length(Hs),.combine =rbind,.options.future = list(packages=c('forecast','Metrics','foreach','doFuture')), .inorder=FALSE,.verbose=TRUE) %dofuture%{  
+#         print(c(ps[p],d,qs[q],Hs[h]))
+#         order = c(ps[p],d,qs[q])
+#         nCV = 600
+#         err_ARIMAX = c()
+#         mase_ARIMAX_i = c()
+#         cv_res=foreach (i = seq(from = 1, to = nCV-Hs[h], by = Hs[h]),.combine =rbind,.options.future = list(packages=c('forecast','Metrics')), .inorder=FALSE,.verbose=TRUE,.errorhandling='pass') %dofuture%{
+#           tmpUSD = trainUSD[(1+i-1):(length(trainUSD)-nCV+i)]  # fixed window
+#           tmpX = trainX[(1+i-1):(nrow(trainX)-nCV+i),]
+#           tmp = ts(tmpUSD, 
+#            start = c(2003,106), 
+#            frequency = 365)
+#   
+#           m_arimax = Arima(tmp, order = order,xreg=data.matrix(tmpX))
+#           val_tmpX=trainX[(nrow(trainX)-nCV+i):(nrow(trainX)-nCV+i+Hs[h]),]
+#   
+#           err_ARIMAX = mean(forecast(m_arimax,Hs[h],xreg=data.matrix(val_tmpX))$mean - trainUSD[(length(trainUSD)-nCV+i):(length(trainUSD)-nCV+i+Hs[h])])
+#           mase_ARIMAX_i=mase(trainUSD[(length(trainUSD)-nCV+i):(length(trainUSD)-nCV+i+Hs[h])],forecast(m_arimax,Hs[h],xreg=data.matrix(val_tmpX))$mean)
+#           return(c(err_ARIMAX,mase_ARIMAX_i))
+#           }
+#         cv_res=data.frame(cv_res)
+#         return(c(ps[p],d,qs[q],Hs[h],mean(abs(ifelse(is.null(unlist(Filter(is.numeric, cv_res[,1]))),NaN,unlist(Filter(is.numeric, cv_res[,1])))),na.rm=TRUE),(mean(unlist(Filter(is.numeric, cv_res[,1]))^2,na.rm=TRUE)),sqrt(mean(unlist(Filter(is.numeric, cv_res[,1]))^2,na.rm=TRUE)),mean(unlist(Filter(is.numeric, cv_res[,2])),na.rm=TRUE)))
+#       }
+
+all_res
+all_res=data.frame(all_res)
+
+#write.csv(all_res, "C:/Users/user/Documents/time_series/ts_hw/all_res_arimax.csv", row.names=FALSE)
+all_res_ <- read.csv("all_res_arimax.csv")
+all_res = all_res_
+
+all_res_best_mase = all_res %>% filter(!is.na(X8)) %>%  arrange(X8) %>% slice(1:5)
+all_res_best_rmse = all_res %>% filter(!is.na(X7)) %>%  arrange(X7) %>% slice(1:5)
+all_res_best=union(all_res_best_mase,all_res_best_rmse)
+
+# предсказание тестовой выборки с выбранным горизонтом прогноза
+future::plan(multisession, workers = 12)
+err_ARIMAX = c()
+        mase_ARIMAX_i = c()
+        cv_res_test=c()
+        cv_res_test_=c()
+        test_errors=data.frame(p=numeric(),d=numeric(),q=numeric(),h=numeric(),MAE=numeric(),MSE=numeric(),RMSE=numeric(),MASE=numeric())
+for (k in 1:nrow(all_res_best)){
+  nCV = 100
+cv_res_test_=foreach(i = seq(from = 1, to = nCV-all_res_best[k,'X4']+1, by = all_res_best[k,'X4']),.combine =rbind,.options.future = list(packages=c('forecast','Metrics')), .inorder=FALSE,.errorhandling='pass') %dofuture% {
+          tmpUSD = d_usd[(1+i-1):(length(d_usd)-nCV+i-1)]  # fixed window
+          tmpX = X[(1+i-1):(nrow(X)-nCV+i-1-1),]
+          tmp = ts(tmpUSD, 
+           start = c(2003,106), 
+           frequency = 365)
+          order=c(all_res_best[k,'X1'],all_res_best[k,'X2'],all_res_best[k,'X3'])
+          m_arimax = Arima(tmp, order = order,xreg=data.matrix(tmpX))
+          val_tmpX=X[(nrow(X)-nCV+i-1):(nrow(X)-nCV+i+all_res_best[k,'X4']-1),]
+  
+          err_ARIMAX = mean(forecast(m_arimax,all_res_best[k,'X4'],xreg=data.matrix(val_tmpX))$mean - d_usd[(length(d_usd)-nCV+i):(length(d_usd)-nCV+i+all_res_best[k,'X4'])])
+          mase_ARIMAX_i=mase(d_usd[(length(d_usd)-nCV+i):(length(d_usd)-nCV+i+all_res_best[k,'X4'])],forecast(m_arimax,all_res_best[k,'X4'],xreg=data.matrix(val_tmpX))$mean)
+          return(c(err_ARIMAX,mase_ARIMAX_i))
+}
+        cv_res_test=data.frame(cv_res_test_)
+        test_errors[nrow(test_errors) + 1,]=c(all_res_best[k,'X1'],all_res_best[k,'X2'],all_res_best[k,'X3'],all_res_best[k,'X4'],mean(abs(ifelse(is.null(unlist(Filter(is.numeric, cv_res_test[,1]))),NaN,unlist(Filter(is.numeric, cv_res_test[,1])))),na.rm=TRUE),(mean(unlist(Filter(is.numeric, cv_res_test[,1]))^2,na.rm=TRUE)),sqrt(mean(unlist(Filter(is.numeric, cv_res_test[,1]))^2,na.rm=TRUE)),mean(unlist(Filter(is.numeric, cv_res_test[,2])),na.rm=TRUE))
+} 
+
+# прогноз на 100 значений
+nToPred = 100
+testUSD = ts(usd[(length(d_usd) - nToPred):length(usd)],
+       end = c(2024,64), #end = c(2024,3, 5), start = c(2023,11,25), 
+       frequency = 365)# from 7524 to 7624
+
+trainUSD = ts(usd[1:(length(usd) - nToPred - 1)],
+       start = c(2003,104), #end = c(2023,11,25),
+       frequency = 365) # from 1 to 7523
+
+testX = X[(nrow(X) - nToPred-1):(nrow(X)-1),]  # from 7524 to 7624
+trainX = X[1:(nrow(X) - nToPred - 1-1),] # from 1 to 7523
+
+d_testUSD = diff(testUSD)
+d_trainUSD = diff(trainUSD)
+
+err_ARIMAX_100 = data.frame(err=numeric())
+mase_ARIMAX_100 = data.frame(MASE=numeric())
+for (k in 1:length(all_res_best[all_res_best$X4==100,])){
+order=c(all_res_best[all_res_best$X4==100,][k,'X1'],all_res_best[all_res_best$X4==100,][k,'X2'],all_res_best[all_res_best$X4==100,][k,'X3'])
+m_arimax = Arima(d_trainUSD, order = order,xreg=data.matrix(trainX))
+  
+err_ARIMAX_100[nrow(err_ARIMAX_100) + 1,] = mean(forecast(m_arimax,100,xreg=data.matrix(testX))$mean - d_testUSD)
+mase_ARIMAX_100[nrow(mase_ARIMAX_100) + 1,]=mase(d_testUSD,forecast(m_arimax,100,xreg=data.matrix(testX))$mean)
+}
+
+summary(m_arimax)
+plot(d_usd)
+lines((d_usd - m_arimax$residuals), col='dark blue')
+plot(m_arimax$residuals)
+gghistogram(err_ARIMAX_100) + ggtitle("Histogram of residuals ARIMAX")
+autoplot(ts(err_ARIMAX_100))+ xlab("Day") + ggtitle("Residuals from ARIMAX")
+checkresiduals(m_arimax)  
+
+```
+
+
+Происходил выбор из следующих параметров:
+p - `r print(ps)`;
+d - `r print(ds)`;
+q - `r print(qs)`;
+
+В качестве X были выбрана цена барреля нефти Брент, ключевая ставка, объемы торгов, дамми по работе биржи.
+
+На тренировочной выборке кроссвалидацией с окном `r nCV` была выбрана модель со следующими характеристиками:
+По MASE:
+`r all_res_best_mase`
+По RMSE:
+`r all_res_best_rmse`
+
+При прогнозировании тестовой выборки с выбранным горизонтом прогноза получаем следующие ошибки:
+MASE `r test_errors[8]`
+
+При прогнозировании на 100 точек тестовой выборки получаем следующие ошибки:
+MASE `r mase_ARIMAX_100`
+
+
+## SARIMAX
+
+```{r SARIMAX, include=FALSE,cache = TRUE}
+
+
+testUSD = d_usd[(length(d_usd) - nToPred):length(d_usd)]  # from 7524 to 7624
+trainUSD = d_usd[1:(length(d_usd) - nToPred - 1)] # from 1 to 7523
+
+testX = X[(nrow(X) - nToPred):nrow(X)-1,]  # from 7524 to 7624
+trainX = X[1:(nrow(X) - nToPred - 1-1),] # from 1 to 7523
+
+Ps <- 2
+Ds = 2
+Qs <- 2
+future::plan(multisession, workers = 12)
+all_ress = foreach (p = 1:nrow(all_res_best),.combine =rbind,.options.future = list(packages=c('forecast','Metrics','foreach','doFuture')), .inorder=FALSE,)
+# %:% 
+#      foreach(Q = 0:Qs,.combine =rbind,.options.future = list(packages=c('forecast','Metrics','foreach','doFuture')), .inorder=FALSE,.verbose=TRUE) %:%
+#      foreach(P = 0:Ps,.combine =rbind,.options.future = list(packages=c('forecast','Metrics','foreach','doFuture')), .inorder=FALSE,.verbose=TRUE) %:%
+#        foreach(D = 0:Ds,.combine =rbind,.options.future = list(packages=c('forecast','Metrics','foreach','doFuture')),.inorder=FALSE,.verbose=TRUE) %dofuture%
+{ 
+        order = c(all_res_best[p,'X1'],all_res_best[p,'X2'],all_res_best[p,'X3'])
+        seasonal = c(1,1,1)
+        nCV = 600
+        err_ARIMAX = c()
+        mase_ARIMAX_i = c()
+        cv_ress=foreach (i = seq(from = 1, to = nCV-all_res_best[p,'X4'], by = all_res_best[p,'X4']),.combine =rbind,.options.future = list(packages=c('forecast','Metrics')), .inorder=FALSE,.errorhandling='pass') %dofuture%{
+          tmpUSD = trainUSD[(1+i-1):(length(trainUSD)-nCV+i)]  # fixed window
+           tmpX = trainX[(1+i-1):(nrow(trainX)-nCV+i),]
+           tmp = ts(tmpUSD, 
+            start = c(2003,106), 
+            frequency = 365)
+  
+          m_sarimax = Arima(tmp, order = order,seasonal = seasonal,xreg=data.matrix(tmpX))
+          val_tmpX=trainX[(nrow(trainX)-nCV+i):(nrow(trainX)-nCV+i+all_res_best[p,'X4']),]
+  
+          err_SARIMAX = mean(forecast(m_sarimax,all_res_best[p,'X4'],xreg=data.matrix(val_tmpX))$mean - trainUSD[(length(trainUSD)-nCV+i):(length(trainUSD)-nCV+i+all_res_best[p,'X4'])])
+          mase_SARIMAX_i=mase(trainUSD[(length(trainUSD)-nCV+i):(length(trainUSD)-nCV+i+all_res_best[p,'X4'])],forecast(m_arimax,all_res_best[p,'X4'],xreg=data.matrix(val_tmpX))$mean)
+          return(c(err_SARIMAX,mase_SARIMAX_i))
+          }
+        cv_ress=data.frame(cv_ress)
+        return(c(all_res_best[p,'X1'],all_res_best[p,'X2'],all_res_best[p,'X3'],P,D,Q,all_res_best[p,'X4'],mean(abs(ifelse(is.null(unlist(Filter(is.numeric, cv_ress[,1]))),NaN,unlist(Filter(is.numeric, cv_ress[,1])))),na.rm=TRUE),(mean(unlist(Filter(is.numeric, cv_ress[,1]))^2,na.rm=TRUE)),sqrt(mean(unlist(Filter(is.numeric, cv_ress[,1]))^2,na.rm=TRUE)),mean(unlist(Filter(is.numeric, cv_ress[,2])),na.rm=TRUE)))
+}
+
+
+all_ress
+all_ress_best_mase = all_ress  %>% filter(!is.na(X8)) %>%  arrange(X8) %>% first
+all_ress_best_rmse = all_ress  %>% filter(!is.na(X8)) %>%  arrange(X8) %>% first
+all_ress_best=union(all_ress_best_mase,all_ress_best_rmse)
+
+future::plan(multisession, workers = 12)
+err_SARIMAX = c()
+        mase_SARIMAX_i = c()
+        cv_ress_test=c()
+        cv_ress_test_=c()
+        test_errors_s=data.frame(p=numeric(),d=numeric(),q=numeric(),h=numeric(),MAE=numeric(),MSE=numeric(),RMSE=numeric(),MASE=numeric())
+for (k in 1:nrow(all_ress_best)){
+  nCV = 100
+cv_res_test_=foreach(i = seq(from = 1, to = nCV-all_ress_best[k,'X4']+1, by = all_ress_best[k,'X4']),.combine =rbind,.options.future = list(packages=c('forecast','Metrics')), .inorder=FALSE,.errorhandling='pass') %dofuture% {
+          tmpUSD = d_usd[(1+i-1):(length(d_usd)-nCV+i-1)]  # fixed window
+          tmpX = X[(1+i-1):(nrow(X)-nCV+i-1-1),]
+          tmp = ts(tmpUSD, 
+           start = c(2003,106), 
+           frequency = 365)
+          order=c(all_ress_best[k,'X1'],all_ress_best[k,'X2'],all_ress_best[k,'X3'])
+          m_sarimax = Arima(tmp, order = order,xreg=data.matrix(tmpX))
+          val_tmpX=X[(nrow(X)-nCV+i-1):(nrow(X)-nCV+i+all_ress_best[k,'X4']-1),]
+  
+          err_SARIMAX = mean(forecast(m_arimax,all_ress_best[k,'X4'],xreg=data.matrix(val_tmpX))$mean - d_usd[(length(d_usd)-nCV+i):(length(d_usd)-nCV+i+all_ress_best[k,'X4'])])
+          mase_SARIMAX_i=mase(d_usd[(length(d_usd)-nCV+i):(length(d_usd)-nCV+i+all_ress_best[k,'X4'])],forecast(m_arimax,all_ress_best[k,'X4'],xreg=data.matrix(val_tmpX))$mean)
+          return(c(err_ARIMAX,mase_ARIMAX_i))
+}
+        cv_ress_test=data.frame(cv_ress_test_)
+        test_errors_s[nrow(test_errors_s) + 1,]=c(all_ress_best[k,'X1'],all_ress_best[k,'X2'],all_ress_best[k,'X3'],all_ress_best[k,'X4'],mean(abs(ifelse(is.null(unlist(Filter(is.numeric, cv_ress_test[,1]))),NaN,unlist(Filter(is.numeric, cv_ress_test[,1])))),na.rm=TRUE),(mean(unlist(Filter(is.numeric, cv_ress_test[,1]))^2,na.rm=TRUE)),sqrt(mean(unlist(Filter(is.numeric, cv_ress_test[,1]))^2,na.rm=TRUE)),mean(unlist(Filter(is.numeric, cv_res_test[,2])),na.rm=TRUE))
+} 
+
+
+# прогноз на 100 значений
+nToPred = 100
+testUSD = ts(usd[(length(d_usd) - nToPred):length(usd)],
+       end = c(2024,64), #end = c(2024,3, 5), start = c(2023,11,25), 
+       frequency = 365)# from 7524 to 7624
+
+trainUSD = ts(usd[1:(length(usd) - nToPred - 1)],
+       start = c(2003,104), #end = c(2023,11,25),
+       frequency = 365) # from 1 to 7523
+
+testX = X[(nrow(X) - nToPred-1):(nrow(X)-1),]  # from 7524 to 7624
+trainX = X[1:(nrow(X) - nToPred - 1-1),] # from 1 to 7523
+
+d_testUSD = diff(testUSD)
+d_trainUSD = diff(trainUSD)
+
+err_SARIMAX_100 = data.frame(err=numeric())
+mase_SARIMAX_100 = data.frame(MASE=numeric())
+for (k in 1:length(all_ress_best[all_res_best$X4==100,])){
+order=c(all_ress_best[all_ress_best$X4==100,][k,'X1'],all_ress_best[all_ress_best$X4==100,][k,'X2'],all_res_best[all_ress_best$X4==100,][k,'X3'])
+m_sarimax = Arima(d_trainUSD, order = order,xreg=data.matrix(trainX))
+  
+err_ARIMAX_100[nrow(err_ARIMAX_100) + 1,] = mean(forecast(m_sarimax,100,xreg=data.matrix(testX))$mean - d_testUSD)
+mase_ARIMAX_100[nrow(mase_ARIMAX_100) + 1,]=mase(d_testUSD,forecast(m_sarimax,100,xreg=data.matrix(testX))$mean)
+}
+
+```
+
+Для сезонности были выбраны следующие параметры: (1,1,1)
+
+В качестве X были выбрана цена барреля нефти Брент, ключевая ставка, объемы торгов, дамми по работе биржи.
+
+На тренировочной выборке кроссвалидацией с окном `r nCV` была выбрана модель со следующими характеристиками:
+По MASE:
+`r all_ress_best_mase`
+По RMSE:
+`r all_ress_best_mase`
+
+При прогнозировании тестовой выборки с выбранным горизонтом прогноза получаем следующие ошибки:
+MASE `r test_errors_s[12]`
+
+При прогнозировании на 100 точек тестовой выборки получаем следующие ошибки:
+MASE `r mase_SARIMAX_100`
+
+## ETS - (Errors, Trend, Seasonal) (без учета первых разниц)
+
+```{r warning=FALSE}
+
+## MASE = 0.03547228
+err_ETS= c()
+
+for (i in 1:nCV){
+  tmpUSD = trainUSD[(1+i-1):(length(trainUSD)-nCV+i)]  # fixed window
+  tmp = ts(tmpUSD, 
+           start = c(2003,04,15), 
+           frequency = 365)
+  
+  mETS = ets(tmp)
+  err_ETS[i] = forecast::forecast(mETS)$mean[1] - usd[(length(usd)-nToPred+1)] 
+  
+}
+
+err_ETS
+
+summary(mETS)
+plot(usd)
+lines((usd - mETS$residuals), col='dark blue')
+plot(mETS$residuals)
+gghistogram(err_ETS) + ggtitle("Histogram of residuals of ETS-model")
+autoplot(ts(err_ETS))+ xlab("Day") + ggtitle("Residuals from ETS-model")
+checkresiduals(mETS) 
+
+```
+
+```{r warning=FALSE}
+
+##ETS - model (Errors, Trend, Seasonal) (with first differences) (с первыми разницами)
+## MASE = 1.479459
+err_ETS1= c()
+
+for (i in 1:nCV){
+  tmpUSD = d_trainUSD[(1+i-1):(length(d_trainUSD)-nCV+i)]  # fixed window
+  tmp = ts(tmpUSD, 
+           start = c(2003,04,15), 
+           frequency = 365)
+  
+  mETS1 = ets(tmp)
+  err_ETS1[i] = forecast::forecast(mETS1)$mean[1] - usd[(length(d_usd)-nToPred+1)] 
+  
+}
+
+err_ETS1
+```
+
+```{r warning=FALSE}
+summary(mETS1)
+plot(d_usd)
+lines((d_usd - mETS1$residuals), col='dark blue')
+plot(mETS1$residuals)
+gghistogram(err_ETS1) + ggtitle("Histogram of residuals of ETS-model")
+autoplot(ts(err_ETS1))+ xlab("Day") + ggtitle("Residuals from ETS-model")
+checkresiduals(mETS1) 
+
+
+##STLF (Seasonal and Trend decomposition using Loess) - метод основан на локальной регрессии (Loess)
+## MASE = 0.03711753  
+err_STLF= c()
+
+for (i in 1:nCV){
+  tmpUSD = trainUSD[(1+i-1):(length(trainUSD)-nCV+i)]  # fixed window
+  tmp = ts(tmpUSD, 
+           start = c(2003,04,15), 
+           frequency = 365)
+  
+  mSTLF <- stlf(tmp)
+  err_STLF[i] = forecast::forecast(mSTLF)$mean[1] - trainUSD[(length(trainUSD)-i+1)] 
+}
+
+err_STLF
+
+summary(mSTLF)
+autoplot(ts(err_STLF)) + xlab("Day") + ylab("") +
+  ggtitle("Residuals from STLF-model")
+gghistogram(err_ETS) + ggtitle("Histogram of residuals STLF-model")
+checkresiduals(mSTLF) 
+
+```
+
+В результате наименьшее MASE у моделей ETS MASE = 0.03547228, STLF MASE= 0.03711753, ARIMA(1,1,1) MASE = 0.620264,
+Сравним эти модели с помощью
+
+# Diebold-Mariano test
+
+
+```{r warning=FALSE}
+dm.test(err_AUTO.ARIMA, err_ARIMA2, 
+        alternative = "two.sided", 
+        h = 1, power = 1)
+
+dm.test(err_AUTO.ARIMA, err_ETS, 
+        alternative = "two.sided", 
+        h = 1, power = 1)
+
+dm.test(err_AUTO.ARIMA, err_STLF, 
+        alternative = "two.sided", 
+        h = 1, power = 1)
+
+dm.test(err_ARIMA2, err_ETS, 
+        alternative = "two.sided", 
+        h = 1, power = 1)
+
+dm.test(err_ARIMA2, err_STLF, 
+        alternative = "two.sided", 
+        h = 1, power = 1)
+
+dm.test(err_ETS, err_STLF, 
+        alternative = "two.sided", 
+        h = 1, power = 1)
+```
+
+
+
+Результаты MASE:
+
+ETS - (Errors, Trend, Seasonal) (без учета первых разниц)
+MASE = 0.1093651
+MASE = 0.03547228  (summary)
+
+
+ETS1 - model (Errors, Trend, Seasonal) (with first differences) (с первыми разницами)
+MASE = 0.612617 
+MASE = 1.479459  (summary)
+
+STLF (Seasonal and Trend decomposition using Loess) - метод основан на локальной регрессии (Loess)
+MASE = 0.0415422 
+MASE = 0.03711753  (summary)
+
+
+## Структурные сдвиги
+
+Используем цены на нефть в качестве предиктора
+
+```{r warning=FALSE}
+tsRBRTE=ts(dd$RBRTE, 
+       start = c(2003,104), 
+       frequency = 365)
+
+d_RBRTE = diff(tsRBRTE)
+
+plot(d_RBRTE)
+
+trainRBRTE = tsRBRTE[1:(length(tsRBRTE) - nToPred - 1)]
+d_trainRBRTE = d_RBRTE[1:(length(d_RBRTE) - nToPred - 1)]
+```
+
+```{r warning=FALSE}
+# Chow test based breaks
+Fres = Fstats(trainUSD ~ trainRBRTE)
+plot(Fres) # показывает где есть сдвиги и какие большие
+
+```
+
+
+```{r warning=FALSE}
+# Chow test based breaks
+d_Fres = Fstats(d_trainUSD ~ d_trainRBRTE)
+plot(d_Fres) # показывает где есть сдвиги и какие большие
+
+```
+В то время как обобщение теста Чоу не выявляет значимых сдвигов для общего ряда, сдвиги наблюдаются в первых 2/3 от временного ряда разности. 
+
+
+```{r warning=FALSE}
+Fres$breakpoint
+Fres$datatsp
+
+d_Fres$breakpoint
+d_Fres$datatsp
+
+```
+
+Точка разлома находятся в 24 июл. 2014 г.- 16 авг. 2014 г. основываясь на двух рядах.
+
+```{r warning=FALSE}
+# CUSUM type
+
+CUSUMres = efp(trainUSD ~ trainRBRTE)
+plot(CUSUMres) # структурные сдвиги с 
+```
+
+
+```{r warning=FALSE}
+# CUSUM type
+
+d_CUSUMres = efp(d_trainUSD ~ d_trainRBRTE)
+plot(d_CUSUMres) 
+```
+
+```{r warning=FALSE}
+# MOSUM
+
+MOSUMres = efp(trainUSD ~ trainRBRTE, type = "Rec-MOSUM")
+plot(MOSUMres) 
+
+?efp()
+```
+
+Cтруктурные сдвиги с 2008, увеличиваются с 2014 по 2016-2017 и дальше с середины 2020 - то есть практически во все теоретические кризисные для России и США моменты 
+
+```{r warning=FALSE}
+# MOSUM
+
+d_MOSUMres = efp(d_trainUSD ~ d_trainRBRTE, type = "Rec-MOSUM")
+plot(d_MOSUMres) 
+```
+
+```{r warning=FALSE}
+# Bai-Perron
+  
+BRres = breakpoints(trainUSD ~ trainRBRTE)
+plot(BRres) # оптимально по БИКу  сдвига
+summary(BRres) # количество наблюдений с разными сдвигами, даты
+
+```
+
+В итоге, можно было бы прогнать нашу лучшую модель на урезанных обучающих данных с 2024г, например, но у нас прогоняется всё по 3 часа :( 
+
